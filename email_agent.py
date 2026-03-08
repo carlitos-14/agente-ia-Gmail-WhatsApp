@@ -1,0 +1,878 @@
+import os, json, base64, logging, time
+from email.header import Header
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from groq import Groq
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from dateutil import parser as dateparser
+
+TZ_MADRID = ZoneInfo("Europe/Madrid")
+
+# Módulos nuevos
+from pdf_context import load_company_context
+from supabase_client import guardar_cita, obtener_ultimo_event_id, eliminar_cita, contar_citas_futuras, MAX_CITAS_ACTIVAS, obtener_citas_futuras_todas, obtener_event_id_por_fecha, obtener_todas_citas_cliente
+from calendar_client import agendar_cita, cancelar_cita, buscar_slots_libres, slot_disponible
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+logger = logging.getLogger(__name__)
+
+# ── Clientes ───────────────────────────────────────────────────────────────────
+groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
+COMPANY = os.environ.get("COMPANY_NAME", "Nuestra Empresa")
+CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "")
+
+# ── Contexto de empresa desde PDF ─────────────────────────────────────────────
+COMPANY_CONTEXT = load_company_context()
+CONTEXT_BLOCK = (
+    f"\n\n---\nDOCUMENTACIÓN DE LA EMPRESA (usa esto para responder preguntas sobre servicios):\n{COMPANY_CONTEXT}\n---"
+    if COMPANY_CONTEXT else ""
+)
+
+# Fecha de hoy para que el LLM pueda resolver expresiones relativas
+_DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+_HOY_DT  = datetime.now(tz=TZ_MADRID)
+_HOY     = f"{_DIAS_ES[_HOY_DT.weekday()]} {_HOY_DT.strftime('%d/%m/%Y')}"
+
+def _calendario_proximos_dias(n=14):
+    """Genera una tabla de los próximos n días para incluir en el prompt."""
+    lineas = []
+    for i in range(n):
+        d = _HOY_DT + timedelta(days=i)
+        lineas.append(f"  - {_DIAS_ES[d.weekday()]} = {d.strftime('%Y-%m-%d')}")
+    return "\n".join(lineas)
+
+_CALENDARIO = _calendario_proximos_dias()
+
+SYSTEM_PROMPT = f"""Eres el asistente de atención al cliente de {COMPANY}.
+{CONTEXT_BLOCK}
+
+La fecha de hoy es {_HOY}. Calendario de los próximos días (úsalo para resolver
+expresiones como "el próximo jueves", "mañana", "la semana que viene"):
+
+{_CALENDARIO}
+
+Siempre devuelve fecha_hora en formato YYYY-MM-DDTHH:MM:SS, nunca texto.
+
+Analiza el email y responde SOLO con JSON válido (sin markdown, sin texto extra).
+Si el cliente pide UNA sola acción, devuelve un objeto. Si pide VARIAS (ej: dos citas), devuelve una lista de objetos:
+
+Un objeto:
+{{
+  "accion": "AGENDAR" | "CANCELAR" | "CANCELAR_TODAS" | "REAGENDAR" | "CONSULTAR" | "RESPONDER" | "ESCALAR",
+  "fecha_hora": "YYYY-MM-DDTHH:MM:SS" (solo si accion es AGENDAR, REAGENDAR o CONSULTAR, si no: null),
+  "respuesta_texto": "Texto completo para el cuerpo del correo al cliente"
+}}
+
+Varias acciones (ejemplo: dos citas):
+[
+  {{"accion": "AGENDAR", "fecha_hora": "2026-03-06T11:00:00", "respuesta_texto": "..."}},
+  {{"accion": "AGENDAR", "fecha_hora": "2026-03-07T14:00:00", "respuesta_texto": "..."}}
+]
+
+IMPORTANTE: Cuando devuelvas una lista, el respuesta_texto de CADA objeto debe ser solo la confirmación de ESA cita concreta. El sistema enviará un único email al cliente juntando todas las confirmaciones.
+
+Reglas de decisión:
+- AGENDAR   → el cliente pide una cita concreta con fecha y hora
+- CANCELAR  → el cliente quiere cancelar una cita existente sin pedir otra.
+              Si menciona una fecha/hora concreta, ponla en fecha_hora.
+              Si menciona solo el día (ej: "la del lunes", "la de mañana", "la del martes"), resuelve la fecha usando el calendario de arriba y ponla en fecha_hora a las 00:00:00 (el sistema buscará la cita más cercana a ese día).
+              Si no especifica nada, fecha_hora es null (se cancelará la más reciente).
+              NUNCA uses ESCALAR para una cancelación, aunque la fecha no sea exacta.
+- CANCELAR_TODAS → el cliente quiere cancelar TODAS sus citas a la vez (ej: "cancela todas mis citas", "elimina todo lo que tenga"). fecha_hora es null.
+- REAGENDAR → el cliente quiere cancelar su cita actual Y pedir una nueva en otra fecha/hora
+              (ej: "cancela mi cita y ponme para el viernes", "quiero cambiar mi cita al lunes a las 10")
+              fecha_hora debe ser la nueva fecha/hora solicitada.
+- CONSULTAR → el cliente pregunta por disponibilidad de un día o una hora concreta sin confirmar cita
+              (ej: "¿tenéis hueco el viernes?", "¿está libre el lunes a las 10?", "¿qué horas tenéis disponibles el martes?")
+              En este caso fecha_hora debe ser el día consultado a las 09:30 si no indica hora, o a la hora indicada si la menciona.
+- RESPONDER → preguntas simples, FAQs, info sobre servicios (usa la documentación)
+- ESCALAR   → quejas, temas legales, situaciones complejas, dudas sin respuesta en la documentación,
+              o cuando el cliente pide explícitamente hablar con una persona, el encargado, responsable o personal humano.
+              En estos casos, respuesta_texto debe explicar claramente al cliente el motivo.
+
+IMPORTANTE: Se atiende TODOS LOS DÍAS de la semana (incluidos sábado y domingo) de 9:30 a 17:00.
+Nunca uses ESCALAR por el hecho de que la cita sea en fin de semana.
+
+SEGURIDAD: Solo puedes gestionar citas del propio remitente del email. Si alguien pide cancelar,
+modificar o consultar citas de otro cliente o usuario, usa ESCALAR con un mensaje explicando
+que no está permitido gestionar citas de terceros.
+
+Si la fecha/hora no está clara para AGENDAR o CONSULTAR, usa ESCALAR en su lugar.
+Para CANCELAR, nunca uses ESCALAR aunque la fecha no sea exacta: intenta siempre resolverla.
+
+IMPORTANTE: En respuesta_texto para AGENDAR NO incluyas fecha ni hora. Escribe únicamente
+el texto de confirmación sin mencionar ninguna fecha ni hora concreta, por ejemplo:
+"Estimado [nombre], gracias por contactarnos. Le confirmamos que su cita ha sido agendada
+en nuestra oficina. Si necesita realizar algún cambio o cancelación, no dude en hacérnoslo saber."
+El sistema insertará automáticamente la fecha y hora correctas."""
+
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.modify",
+]
+
+BOT_LABEL = "bot-processed"
+
+
+# ── Autenticación Gmail ────────────────────────────────────────────────────────
+def get_gmail_service():
+    creds_data = json.loads(os.environ["GMAIL_CREDENTIALS_JSON"])
+    creds = Credentials(
+        token=creds_data.get("token"),
+        refresh_token=creds_data.get("refresh_token"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=creds_data.get("client_id"),
+        client_secret=creds_data.get("client_secret"),
+        scopes=GMAIL_SCOPES,
+    )
+    if not creds.valid:
+        if creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            raise RuntimeError("Credenciales de Gmail inválidas y sin refresh_token.")
+    return build("gmail", "v1", credentials=creds)
+
+
+# ── Label bot-processed ────────────────────────────────────────────────────────
+def get_or_create_label(svc):
+    labels = svc.users().labels().list(userId="me").execute().get("labels", [])
+    for l in labels:
+        if l["name"] == BOT_LABEL:
+            return l["id"]
+    created = svc.users().labels().create(
+        userId="me", body={"name": BOT_LABEL}
+    ).execute()
+    logger.info(f"🏷️ Label '{BOT_LABEL}' creado en Gmail.")
+    return created["id"]
+
+
+# ── Extracción de cuerpo del email ─────────────────────────────────────────────
+def get_body(payload):
+    mime = payload.get("mimeType", "")
+    if mime == "text/plain":
+        data = payload.get("body", {}).get("data", "")
+        if data:
+            return base64.urlsafe_b64decode(data).decode("utf-8", "ignore")[:3000]
+    for part in payload.get("parts", []):
+        result = get_body(part)
+        if result:
+            return result
+    return ""
+
+
+# ── Envío de respuesta ─────────────────────────────────────────────────────────
+def send_reply(svc, mid, tid, to, subject, text):
+    reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+    encoded_subject = Header(reply_subject, "utf-8").encode()
+    msg = (
+        f"To: {to}\r\n"
+        f"Subject: {encoded_subject}\r\n"
+        f"Content-Type: text/plain; charset=utf-8\r\n"
+        f"In-Reply-To: {mid}\r\n"
+        f"References: {mid}\r\n\r\n"
+        f"{text}"
+    )
+    svc.users().messages().send(
+        userId="me",
+        body={
+            "raw": base64.urlsafe_b64encode(msg.encode("utf-8")).decode(),
+            "threadId": tid,
+        }
+    ).execute()
+
+
+def mark_read(svc, mid):
+    svc.users().messages().modify(
+        userId="me", id=mid, body={"removeLabelIds": ["UNREAD"]}
+    ).execute()
+
+
+def mark_starred(svc, mid):
+    svc.users().messages().modify(
+        userId="me", id=mid, body={"addLabelIds": ["STARRED"]}
+    ).execute()
+
+
+def mark_bot_processed(svc, mid, label_id):
+    svc.users().messages().modify(
+        userId="me", id=mid, body={"addLabelIds": [label_id]}
+    ).execute()
+
+
+# ── Análisis con Groq/LLaMA ────────────────────────────────────────────────────
+def analyze(subject, sender, body, retries=3, backoff=5):
+    last_error = None
+    for attempt in range(retries):
+        try:
+            response = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Asunto: {subject}\nDe: {sender}\nContenido: {body}"}
+                ],
+                temperature=0.2,
+                max_tokens=500,
+            )
+            text = response.choices[0].message.content.strip()
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            return json.loads(text.strip())
+        except Exception as e:
+            last_error = e
+            wait = backoff * (attempt + 1)
+            logger.warning(f"⚠️ Intento {attempt + 1}/{retries} fallido: {e}. Reintentando en {wait}s...")
+            time.sleep(wait)
+    raise last_error
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+
+def fecha_legible(dt: datetime) -> str:
+    return f"{DIAS[dt.weekday()]} {dt.strftime('%d/%m/%Y')} a las {dt.strftime('%H:%M')}"
+
+
+def slots_del_dia(fecha_referencia: datetime, hora_concreta: bool = False, num_slots: int = 3) -> list[datetime]:
+    """
+    Si hora_concreta=True, comprueba solo esa hora exacta.
+    Si hora_concreta=False, busca hasta num_slots huecos libres en ese día (9:30-17:00).
+    """
+    HORA_INICIO = 9
+    MIN_INICIO  = 30
+    HORA_FIN    = 17
+
+    if hora_concreta:
+        return [fecha_referencia] if slot_disponible(fecha_referencia) else []
+
+    candidatos = []
+    hora = fecha_referencia.replace(hour=HORA_INICIO, minute=MIN_INICIO, second=0, microsecond=0)
+    while hora.hour < HORA_FIN:
+        if slot_disponible(hora):
+            candidatos.append(hora)
+            if len(candidatos) >= num_slots:
+                break
+        hora += timedelta(hours=1)
+
+    return candidatos
+
+
+# ── Manejadores de cada acción ─────────────────────────────────────────────────
+def handle_agendar(svc, mid, tid, sender, subject, decision, solo_resultado=False):
+    fecha_str = decision.get("fecha_hora")
+    respuesta = decision.get("respuesta_texto", "")
+
+    if not fecha_str:
+        logger.warning("⚠️ AGENDAR sin fecha_hora. Escalando.")
+        mark_starred(svc, mid)
+        return None
+
+    citas_activas = contar_citas_futuras(email=sender)
+    if citas_activas >= MAX_CITAS_ACTIVAS:
+        logger.info(f"🚫 Límite de citas alcanzado para {sender} ({citas_activas}/{MAX_CITAS_ACTIVAS}).")
+        mensaje_limite = (
+            f"Hola,\n\n"
+            f"Gracias por contactarnos. Actualmente ya tienes {citas_activas} "
+            f"{'cita pendiente' if citas_activas == 1 else 'citas pendientes'} con nosotros y no es posible "
+            f"reservar más de {MAX_CITAS_ACTIVAS} a la vez.\n\n"
+            f"Si necesitas cancelar alguna de tus citas actuales o tienes cualquier duda, "
+            f"no dudes en escribirnos y te ayudamos encantados.\n\n"
+            f"Un saludo,\n{COMPANY}"
+        )
+        if not solo_resultado:
+            send_reply(svc, mid, tid, sender, subject, mensaje_limite)
+            mark_read(svc, mid)
+        return mensaje_limite if solo_resultado else None
+
+    try:
+        fecha_dt = dateparser.parse(fecha_str)
+        if fecha_dt is None:
+            raise ValueError("dateparser devolvió None")
+        fecha_dt = fecha_dt.replace(tzinfo=None).replace(tzinfo=TZ_MADRID)
+    except Exception as e:
+        logger.error(f"❌ No se pudo parsear la fecha '{fecha_str}': {e}. Escalando.")
+        mark_starred(svc, mid)
+        msg_error = (
+            f"No hemos podido identificar la fecha '{fecha_str}'. "
+            f"¿Podrías especificar el día y hora exactos?"
+        )
+        if not solo_resultado:
+            send_reply(svc, mid, tid, sender, subject,
+                f"Hola,\n\n{msg_error}\n\nUn saludo,\n{COMPANY}")
+            mark_read(svc, mid)
+        return msg_error if solo_resultado else None
+
+    hoy = datetime.now(tz=TZ_MADRID)
+    if fecha_dt < hoy:
+        fecha_dt = fecha_dt.replace(year=hoy.year)
+        if fecha_dt < hoy:
+            fecha_dt = fecha_dt.replace(year=hoy.year + 1)
+        logger.warning(f"⚠️ Fecha en el pasado corregida a: {fecha_dt}")
+
+    event_id = agendar_cita(fecha_dt, sender, subject)
+
+    if event_id:
+        guardar_cita(email=sender, event_id=event_id, fecha_cita=fecha_dt)
+        confirmacion = (
+            f"{respuesta.rstrip()}\n\n"
+            f"📅 Fecha confirmada: {fecha_legible(fecha_dt)}."
+        )
+        if not solo_resultado:
+            send_reply(svc, mid, tid, sender, subject, confirmacion)
+            mark_read(svc, mid)
+        logger.info(f"📅 Cita agendada: {subject[:60]} → {fecha_legible(fecha_dt)}")
+        return f"📅 {fecha_legible(fecha_dt)}" if solo_resultado else None
+    else:
+        logger.warning("⛔ Slot ocupado. Buscando alternativas.")
+        slots_libres = buscar_slots_libres(fecha_dt, num_slots=3)
+        if slots_libres:
+            opciones_texto = "\n".join(f"  • {fecha_legible(s)}" for s in slots_libres)
+            mensaje_ocupado = (
+                f"Lamentablemente el horario solicitado ({fecha_legible(fecha_dt)}) no está disponible.\n\n"
+                f"Fechas libres próximas:\n\n{opciones_texto}\n\n"
+                f"Confírmanos cuál te viene mejor."
+            )
+        else:
+            mensaje_ocupado = (
+                f"Lamentablemente el horario solicitado ({fecha_legible(fecha_dt)}) no está disponible "
+                f"y no encontramos huecos próximos. Por favor, indícanos otro horario."
+            )
+        if not solo_resultado:
+            send_reply(svc, mid, tid, sender, subject,
+                f"Hola,\n\n{mensaje_ocupado}\n\nRecuerda que atendemos todos los días de 9:30 a 17:00.\n\nUn saludo,\n{COMPANY}")
+            mark_read(svc, mid)
+        return mensaje_ocupado if solo_resultado else None
+
+
+def handle_consultar(svc, mid, tid, sender, subject, decision):
+    """Responde con los huecos disponibles del día/hora consultado."""
+    fecha_str = decision.get("fecha_hora")
+
+    if not fecha_str:
+        logger.warning("⚠️ CONSULTAR sin fecha_hora. Escalando.")
+        mark_starred(svc, mid)
+        return
+
+    try:
+        fecha_dt = dateparser.parse(fecha_str)
+        if fecha_dt is None:
+            raise ValueError("dateparser devolvió None")
+        fecha_dt = fecha_dt.replace(tzinfo=None).replace(tzinfo=TZ_MADRID)
+    except Exception as e:
+        logger.error(f"❌ No se pudo parsear la fecha '{fecha_str}': {e}. Escalando.")
+        mark_starred(svc, mid)
+        send_reply(svc, mid, tid, sender, subject,
+            f"Hola,\n\n"
+            f"Gracias por contactarnos. No hemos podido identificar claramente el día que nos indicas. "
+            f"¿Podrías especificarnos la fecha concreta? Por ejemplo: 'el sábado 7 de marzo'.\n\n"
+            f"Un saludo,\n{COMPANY}"
+        )
+        mark_read(svc, mid)
+        return
+
+    hoy = datetime.now(tz=TZ_MADRID)
+    if fecha_dt < hoy:
+        fecha_dt = fecha_dt.replace(year=hoy.year)
+        if fecha_dt < hoy:
+            fecha_dt = fecha_dt.replace(year=hoy.year + 1)
+
+    hora_concreta = not (fecha_dt.hour == 9 and fecha_dt.minute == 30)
+    slots = slots_del_dia(fecha_dt, hora_concreta=hora_concreta, num_slots=3)
+
+    dia_str = f"{DIAS[fecha_dt.weekday()]} {fecha_dt.strftime('%d/%m/%Y')}"
+
+    if hora_concreta:
+        if slots:
+            mensaje = (
+                f"Hola,\n\n"
+                f"Sí, el {dia_str} a las {fecha_dt.strftime('%H:%M')} está disponible.\n\n"
+                f"Si deseas confirmar la cita, responde a este correo y lo agendamos de inmediato.\n\n"
+                f"Recuerda que atendemos todos los días de 9:30 a 17:00.\n\n"
+                f"Un saludo,\n{COMPANY}"
+            )
+        else:
+            alternativas = slots_del_dia(fecha_dt, hora_concreta=False, num_slots=3)
+            if alternativas:
+                opciones_texto = "\n".join(f"  • {fecha_legible(s)}" for s in alternativas)
+                mensaje = (
+                    f"Hola,\n\n"
+                    f"Lamentablemente el {dia_str} a las {fecha_dt.strftime('%H:%M')} no está disponible.\n\n"
+                    f"Sin embargo, sí tenemos los siguientes huecos libres ese día:\n\n"
+                    f"{opciones_texto}\n\n"
+                    f"¿Te viene bien alguno? Responde confirmando y lo agendamos.\n\n"
+                    f"Un saludo,\n{COMPANY}"
+                )
+            else:
+                proximos = buscar_slots_libres(fecha_dt, num_slots=3)
+                if proximos:
+                    opciones_texto = "\n".join(f"  • {fecha_legible(s)}" for s in proximos)
+                    mensaje = (
+                        f"Hola,\n\n"
+                        f"Lamentablemente el {dia_str} no tenemos huecos disponibles.\n\n"
+                        f"Las próximas fechas libres más cercanas son:\n\n"
+                        f"{opciones_texto}\n\n"
+                        f"¿Te viene bien alguna? Responde confirmando y lo agendamos.\n\n"
+                        f"Un saludo,\n{COMPANY}"
+                    )
+                else:
+                    mensaje = (
+                        f"Hola,\n\n"
+                        f"Lamentablemente el {dia_str} no tenemos huecos disponibles "
+                        f"ni encontramos fechas libres en los próximos días.\n\n"
+                        f"Por favor, contáctanos de nuevo más adelante.\n\n"
+                        f"Recuerda que atendemos todos los días de 9:30 a 17:00.\n\n"
+                        f"Un saludo,\n{COMPANY}"
+                    )
+    else:
+        if slots:
+            opciones_texto = "\n".join(f"  • {fecha_legible(s)}" for s in slots)
+            mensaje = (
+                f"Hola,\n\n"
+                f"Para el {dia_str} tenemos los siguientes huecos disponibles:\n\n"
+                f"{opciones_texto}\n\n"
+                f"Si deseas confirmar alguno, responde a este correo indicando tu preferencia.\n\n"
+                f"Un saludo,\n{COMPANY}"
+            )
+        else:
+            proximos = buscar_slots_libres(fecha_dt, num_slots=3)
+            if proximos:
+                opciones_texto = "\n".join(f"  • {fecha_legible(s)}" for s in proximos)
+                mensaje = (
+                    f"Hola,\n\n"
+                    f"Lamentablemente el {dia_str} no tenemos huecos disponibles.\n\n"
+                    f"Las próximas fechas libres más cercanas son:\n\n"
+                    f"{opciones_texto}\n\n"
+                    f"¿Te viene bien alguna? Responde confirmando y lo agendamos.\n\n"
+                    f"Un saludo,\n{COMPANY}"
+                )
+            else:
+                mensaje = (
+                    f"Hola,\n\n"
+                    f"Lamentablemente el {dia_str} no tenemos huecos disponibles "
+                    f"ni encontramos fechas libres en los próximos días.\n\n"
+                    f"Por favor, contáctanos de nuevo más adelante.\n\n"
+                    f"Recuerda que atendemos todos los días de 9:30 a 17:00.\n\n"
+                    f"Un saludo,\n{COMPANY}"
+                )
+
+    send_reply(svc, mid, tid, sender, subject, mensaje)
+    mark_read(svc, mid)
+    logger.info(f"🔍 Consulta de disponibilidad respondida: {subject[:60]}")
+
+
+def handle_cancelar(svc, mid, tid, sender, subject, decision, solo_resultado=False):
+    respuesta = decision.get("respuesta_texto", "")
+    fecha_str = decision.get("fecha_hora")
+
+    if fecha_str:
+        try:
+            fecha_dt = dateparser.parse(fecha_str)
+            if fecha_dt is None:
+                raise ValueError("dateparser devolvió None")
+            fecha_dt = fecha_dt.replace(tzinfo=None).replace(tzinfo=TZ_MADRID)
+            event_id = obtener_event_id_por_fecha(fecha_dt, email=sender)
+        except Exception as e:
+            logger.error(f"❌ No se pudo parsear fecha de cancelación '{fecha_str}': {e}")
+            event_id = obtener_ultimo_event_id(email=sender)
+    else:
+        event_id = obtener_ultimo_event_id(email=sender)
+
+    if not event_id:
+        logger.warning(f"⚠️ No se encontró cita para cancelar: {sender}. Escalando.")
+        mark_starred(svc, mid)
+        if not solo_resultado:
+            send_reply(svc, mid, tid, sender, subject,
+                f"Hola,\n\n"
+                f"No hemos encontrado ninguna cita registrada para cancelar. "
+                f"Si crees que es un error, por favor contáctanos.\n\n"
+                f"Un saludo,\n{COMPANY}"
+            )
+            mark_read(svc, mid)
+        return None
+
+    cancelado = cancelar_cita(event_id)
+
+    if cancelado:
+        eliminar_cita(email=sender, event_id=event_id)
+        fecha_legible_str = fecha_legible(fecha_dt) if fecha_str and fecha_dt else "tu cita"
+        if not solo_resultado:
+            send_reply(svc, mid, tid, sender, subject, respuesta)
+            mark_read(svc, mid)
+        logger.info(f"🗑️ Cita cancelada: {subject[:60]}")
+        return fecha_legible_str if solo_resultado else None
+    else:
+        logger.error("❌ Fallo al cancelar evento en Calendar. Escalando.")
+        mark_starred(svc, mid)
+        return None
+
+
+def handle_reagendar(svc, mid, tid, sender, subject, decision):
+    """Cancela la cita existente y agenda una nueva en la fecha indicada."""
+    fecha_str = decision.get("fecha_hora")
+
+    if not fecha_str:
+        logger.warning("⚠️ REAGENDAR sin fecha_hora. Escalando.")
+        mark_starred(svc, mid)
+        return
+
+    event_id_actual = obtener_ultimo_event_id(email=sender)
+    if event_id_actual:
+        if cancelar_cita(event_id_actual):
+            eliminar_cita(email=sender, event_id=event_id_actual)
+            logger.info(f"🗑️ Cita anterior cancelada: {event_id_actual}")
+        else:
+            logger.error("❌ Fallo al cancelar cita anterior. Escalando.")
+            mark_starred(svc, mid)
+            return
+    else:
+        logger.warning(f"⚠️ No se encontró cita previa para {sender}, se procede a agendar igualmente.")
+
+    try:
+        fecha_dt = dateparser.parse(fecha_str)
+        if fecha_dt is None:
+            raise ValueError("dateparser devolvió None")
+        fecha_dt = fecha_dt.replace(tzinfo=None).replace(tzinfo=TZ_MADRID)
+    except Exception as e:
+        logger.error(f"❌ No se pudo parsear la fecha '{fecha_str}': {e}. Escalando.")
+        mark_starred(svc, mid)
+        send_reply(svc, mid, tid, sender, subject,
+            f"Hola,\n\n"
+            f"Hemos cancelado tu cita anterior pero no hemos podido identificar la nueva fecha. "
+            f"¿Podrías indicarnos el día y hora exactos? Por ejemplo: 'el viernes 6 a las 11:00'.\n\n"
+            f"Un saludo,\n{COMPANY}"
+        )
+        mark_read(svc, mid)
+        return
+
+    hoy = datetime.now(tz=TZ_MADRID)
+    if fecha_dt < hoy:
+        fecha_dt = fecha_dt.replace(year=hoy.year)
+        if fecha_dt < hoy:
+            fecha_dt = fecha_dt.replace(year=hoy.year + 1)
+
+    event_id_nuevo = agendar_cita(fecha_dt, sender, subject)
+
+    if event_id_nuevo:
+        guardar_cita(email=sender, event_id=event_id_nuevo, fecha_cita=fecha_dt)
+        respuesta = decision.get("respuesta_texto", "")
+        confirmacion = (
+            f"{respuesta.rstrip()}\n\n"
+            f"📅 Nueva cita confirmada: {fecha_legible(fecha_dt)}."
+        )
+        send_reply(svc, mid, tid, sender, subject, confirmacion)
+        mark_read(svc, mid)
+        logger.info(f"🔄 Cita reagendada: {subject[:60]} → {fecha_legible(fecha_dt)}")
+    else:
+        slots_libres = buscar_slots_libres(fecha_dt, num_slots=3)
+        if slots_libres:
+            opciones_texto = "\n".join(f"  • {fecha_legible(s)}" for s in slots_libres)
+            mensaje = (
+                f"Hola,\n\n"
+                f"Hemos cancelado tu cita anterior. Sin embargo, el horario solicitado "
+                f"({fecha_legible(fecha_dt)}) no está disponible.\n\n"
+                f"Te proponemos estas fechas libres próximas:\n\n"
+                f"{opciones_texto}\n\n"
+                f"Confírmanos cuál te viene mejor y lo agendamos.\n\n"
+                f"Un saludo,\n{COMPANY}"
+            )
+        else:
+            mensaje = (
+                f"Hola,\n\n"
+                f"Hemos cancelado tu cita anterior. Sin embargo, el horario solicitado "
+                f"({fecha_legible(fecha_dt)}) no está disponible y no encontramos huecos próximos.\n\n"
+                f"Por favor, indícanos otro horario y lo revisamos.\n\n"
+                f"Recuerda que atendemos todos los días de 9:30 a 17:00.\n\n"
+                f"Un saludo,\n{COMPANY}"
+            )
+        send_reply(svc, mid, tid, sender, subject, mensaje)
+        mark_read(svc, mid)
+
+
+def handle_cancelar_todas(svc, mid, tid, sender, subject, decision):
+    citas = obtener_todas_citas_cliente(email=sender)
+
+    if not citas:
+        send_reply(svc, mid, tid, sender, subject,
+            f"Hola,\n\n"
+            f"No hemos encontrado ninguna cita futura registrada para tu cuenta.\n\n"
+            f"Un saludo,\n{COMPANY}"
+        )
+        mark_read(svc, mid)
+        return
+
+    canceladas = []
+    fallidas = []
+
+    for cita in citas:
+        event_id   = cita["event_id"]
+        fecha_cita = cita["fecha_cita"]
+        try:
+            fecha_dt = dateparser.parse(fecha_cita)
+            fecha_dt = fecha_dt.replace(tzinfo=None).replace(tzinfo=TZ_MADRID)
+            fecha_str = fecha_legible(fecha_dt)
+        except Exception:
+            fecha_str = fecha_cita
+
+        if cancelar_cita(event_id):
+            eliminar_cita(email=sender, event_id=event_id)
+            canceladas.append(fecha_str)
+            logger.info(f"🗑️ Cancelada: {event_id} ({fecha_str})")
+        else:
+            fallidas.append(fecha_str)
+            logger.error(f"❌ Fallo al cancelar: {event_id} ({fecha_str})")
+
+    if canceladas:
+        lista = "\n".join(f"  {i+1}. 🗑️ {f}" for i, f in enumerate(canceladas))
+        msg = (
+            f"Hola,\n\n"
+            f"Hemos cancelado todas tus citas:\n\n{lista}\n\n"
+        )
+        if fallidas:
+            msg += f"No pudimos cancelar las siguientes (revísalas manualmente):\n" + \
+                   "\n".join(f"  • {f}" for f in fallidas) + "\n\n"
+        msg += f"Si necesitas reservar una nueva cita, estaremos encantados de ayudarte.\n\nUn saludo,\n{COMPANY}"
+    else:
+        msg = (
+            f"Hola,\n\nNo pudimos cancelar tus citas. Por favor, contáctanos para resolverlo.\n\nUn saludo,\n{COMPANY}"
+        )
+
+    send_reply(svc, mid, tid, sender, subject, msg)
+    mark_read(svc, mid)
+    if fallidas:
+        mark_starred(svc, mid)
+
+
+def handle_responder(svc, mid, tid, sender, subject, decision):
+    """Envía una respuesta directa al cliente con la info solicitada."""
+    respuesta = decision.get("respuesta_texto", "")
+    if respuesta:
+        send_reply(svc, mid, tid, sender, subject, respuesta)
+        mark_read(svc, mid)
+        logger.info(f"✅ Respondido: {subject[:60]}")
+    else:
+        logger.warning("⚠️ RESPONDER sin respuesta_texto. Escalando.")
+        mark_starred(svc, mid)
+
+
+def handle_escalar(svc, mid, tid, sender, subject, decision):
+    mark_starred(svc, mid)
+    motivo = decision.get("respuesta_texto", "Sin motivo especificado")
+    logger.info(f"⭐ Escalado: {subject[:60]} | Motivo: {motivo[:80]}")
+
+    mensaje_cliente = motivo if motivo else (
+        f"Hola,\n\n"
+        f"Hemos recibido tu mensaje y nuestro equipo lo revisará a la mayor brevedad posible.\n\n"
+        f"En breve nos pondremos en contacto contigo.\n\n"
+        f"Un saludo,\n{COMPANY}"
+    )
+    send_reply(svc, mid, tid, sender, subject, mensaje_cliente)
+
+    if CONTACT_EMAIL:
+        aviso_interno = (
+            f"Se ha escalado un email para revisión manual.\n\n"
+            f"De: {sender}\n"
+            f"Asunto: {subject}\n"
+            f"Motivo: {motivo}\n\n"
+            f"Revísalo en Gmail (estará marcado con ⭐)."
+        )
+        try:
+            msg = (
+                f"To: {CONTACT_EMAIL}\r\n"
+                f"Subject: [ESCALADO] {subject}\r\n"
+                f"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+                f"{aviso_interno}"
+            )
+            svc.users().messages().send(
+                userId="me",
+                body={"raw": base64.urlsafe_b64encode(msg.encode("utf-8")).decode()},
+            ).execute()
+            logger.info(f"📨 Aviso de escalado enviado a {CONTACT_EMAIL}")
+        except Exception as e:
+            logger.error(f"❌ Error enviando aviso de escalado: {e}")
+
+
+# ── Sincronización Supabase ↔ Calendar ────────────────────────────────────────
+def sincronizar_citas_huerfanas():
+    from calendar_client import get_calendar_service, CALENDAR_ID, EVENT_DURATION_MINUTES
+    from zoneinfo import ZoneInfo
+
+    try:
+        svc = get_calendar_service()
+    except Exception as e:
+        logger.error(f"❌ No se pudo conectar a Calendar para sincronizar: {e}")
+        return
+
+    citas_supabase = obtener_citas_futuras_todas()
+    event_ids_supabase = {c["event_id"] for c in citas_supabase}
+
+    eliminadas_supabase = 0
+    for cita in citas_supabase:
+        event_id = cita["event_id"]
+        email    = cita["email"]
+        try:
+            svc.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
+        except Exception:
+            logger.info(f"🧹 [Supabase→Cal] Huérfana en Supabase: {event_id} ({email}) → eliminando.")
+            eliminar_cita(email=email, event_id=event_id)
+            eliminadas_supabase += 1
+
+    eliminadas_calendar = 0
+    try:
+        ahora = datetime.now(tz=ZoneInfo("Europe/Madrid"))
+        eventos = svc.events().list(
+            calendarId=CALENDAR_ID,
+            timeMin=ahora.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+            q="Cita:",
+        ).execute().get("items", [])
+
+        for evento in eventos:
+            eid = evento.get("id")
+            if eid not in event_ids_supabase:
+                logger.info(f"🧹 [Cal→Supabase] Huérfano en Calendar: {eid} → cancelando.")
+                try:
+                    svc.events().delete(
+                        calendarId=CALENDAR_ID,
+                        eventId=eid,
+                        sendUpdates="all",
+                    ).execute()
+                    eliminadas_calendar += 1
+                except Exception as e:
+                    logger.error(f"❌ Error cancelando evento huérfano {eid}: {e}")
+    except Exception as e:
+        logger.error(f"❌ Error consultando eventos de Calendar: {e}")
+
+    total = eliminadas_supabase + eliminadas_calendar
+    if total:
+        logger.info(f"🧹 Sincronización completa: {eliminadas_supabase} eliminada(s) de Supabase, {eliminadas_calendar} de Calendar.")
+    else:
+        logger.info("✅ Sincronización OK: Supabase y Calendar están alineados.")
+
+
+# ── Procesador principal ───────────────────────────────────────────────────────
+def process_new_emails():
+    logger.info("🔍 Revisando emails...")
+
+    sincronizar_citas_huerfanas()
+
+    svc = get_gmail_service()
+    label_id = get_or_create_label(svc)
+
+    msgs = svc.users().messages().list(
+        userId="me",
+        labelIds=["INBOX", "UNREAD"],
+        maxResults=10,
+        q=f"-label:{BOT_LABEL}"
+    ).execute().get("messages", [])
+
+    new_count = 0
+    for ref in msgs:
+        mid = ref["id"]
+
+        msg = svc.users().messages().get(userId="me", id=mid, format="full").execute()
+        h = {x["name"]: x["value"] for x in msg["payload"]["headers"]}
+        subject = h.get("Subject", "(sin asunto)")
+        sender  = h.get("From", "?")
+        body    = get_body(msg["payload"])
+        tid     = msg["threadId"]
+
+        try:
+            decision = analyze(subject, sender, body)
+            if isinstance(decision, dict):
+                decisions = [decision]
+            elif isinstance(decision, list):
+                decisions = [d for d in decision if isinstance(d, dict)]
+                if not decisions:
+                    raise ValueError("Lista vacía o sin dicts válidos")
+            else:
+                raise ValueError(f"Respuesta inesperada del LLM: {type(decision)}")
+        except Exception as e:
+            logger.error(f"Error Groq tras reintentos: {e}")
+            decisions = [{
+                "accion": "ESCALAR",
+                "fecha_hora": None,
+                "respuesta_texto": f"Error IA: {e}"
+            }]
+
+        respuestas_finales = []
+        cancelaciones = []
+        escalado = False
+
+        for decision in decisions:
+            accion = decision.get("accion", "ESCALAR").upper()
+
+            if accion == "AGENDAR":
+                resultado = handle_agendar(svc, mid, tid, sender, subject, decision, solo_resultado=True)
+                if resultado:
+                    respuestas_finales.append(resultado)
+            elif accion == "CANCELAR":
+                resultado = handle_cancelar(svc, mid, tid, sender, subject, decision, solo_resultado=True)
+                if resultado:
+                    cancelaciones.append(resultado)
+            elif accion == "CANCELAR_TODAS":
+                handle_cancelar_todas(svc, mid, tid, sender, subject, decision)
+            elif accion == "CONSULTAR":
+                handle_consultar(svc, mid, tid, sender, subject, decision)
+            elif accion == "REAGENDAR":
+                handle_reagendar(svc, mid, tid, sender, subject, decision)
+            elif accion == "RESPONDER":
+                handle_responder(svc, mid, tid, sender, subject, decision)
+            else:
+                escalado = True
+                handle_escalar(svc, mid, tid, sender, subject, decision)
+
+        if respuestas_finales:
+            if len(respuestas_finales) == 1:
+                cuerpo_final = (
+                    f"Estimado/a cliente,\n\n"
+                    f"Le confirmamos que su cita ha sido agendada:\n\n"
+                    f"{respuestas_finales[0]}\n\n"
+                    f"Si necesita realizar algún cambio o cancelación, no dude en contactarnos.\n\n"
+                    f"Un saludo,\n{COMPANY}"
+                )
+            else:
+                fechas = "\n".join(f"  {i+1}. {r}" for i, r in enumerate(respuestas_finales))
+                cuerpo_final = (
+                    f"Estimado/a cliente,\n\n"
+                    f"Le confirmamos que sus {len(respuestas_finales)} citas han sido agendadas:\n\n"
+                    f"{fechas}\n\n"
+                    f"Si necesita realizar algún cambio o cancelación, no dude en contactarnos.\n\n"
+                    f"Un saludo,\n{COMPANY}"
+                )
+            send_reply(svc, mid, tid, sender, subject, cuerpo_final)
+            mark_read(svc, mid)
+
+        if cancelaciones:
+            if len(cancelaciones) == 1:
+                cuerpo_cancel = (
+                    f"Estimado/a cliente,\n\n"
+                    f"Le confirmamos que su cita ha sido cancelada:\n\n"
+                    f"  🗑️ {cancelaciones[0]}\n\n"
+                    f"Si desea reservar una nueva cita, no dude en escribirnos.\n\n"
+                    f"Un saludo,\n{COMPANY}"
+                )
+            else:
+                fechas = "\n".join(f"  {i+1}. 🗑️ {c}" for i, c in enumerate(cancelaciones))
+                cuerpo_cancel = (
+                    f"Estimado/a cliente,\n\n"
+                    f"Le confirmamos que sus {len(cancelaciones)} citas han sido canceladas:\n\n"
+                    f"{fechas}\n\n"
+                    f"Si desea reservar nuevas citas, no dude en escribirnos.\n\n"
+                    f"Un saludo,\n{COMPANY}"
+                )
+            send_reply(svc, mid, tid, sender, subject, cuerpo_cancel)
+            mark_read(svc, mid)
+
+        mark_bot_processed(svc, mid, label_id)
+        new_count += 1
+
+    logger.info(f"✔ Listo. {new_count} emails nuevos procesados.")
+
+
+if __name__ == "__main__":
+    process_new_emails()
